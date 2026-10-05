@@ -67,6 +67,9 @@ class Api:
         add("GET", "/api/soc", lambda params, body: self._platform.soc_snapshot())
         add("GET", "/api/balance", lambda params, body: self._platform.balance_snapshot())
         add("GET", "/api/quota", lambda params, body: self._platform.quota_snapshot())
+        add("GET", "/api/dispatch", lambda params, body: self._platform.dispatch_snapshot())
+        add("GET", "/api/dispatch/stations", lambda params, body: self._platform.dispatch_station_snapshot())
+        add("GET", "/api/dispatch/order/{order_id}", self._dispatch_order)
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/audit/report", lambda params, body: self._platform.audit.report())
         add("GET", "/api/audit/operations", self._operations)
@@ -100,6 +103,16 @@ class Api:
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/probe/pcs", self._probe_pcs)
         add("POST", "/api/probe/fault", self._probe_fault)
+        add("POST", "/api/dispatch/stations", self._register_dispatch_station)
+        add("POST", "/api/dispatch/stations/online", self._dispatch_station_online)
+        add("POST", "/api/dispatch/stations/remaining", self._dispatch_station_remaining)
+        add("POST", "/api/dispatch/stations/fail-delivery", self._dispatch_station_fail_delivery)
+        add("POST", "/api/dispatch/target", self._submit_dispatch_target)
+        add("POST", "/api/dispatch/collect", self._collect_dispatch)
+        add("POST", "/api/dispatch/receipt/delivery", self._dispatch_delivery_receipt)
+        add("POST", "/api/dispatch/receipt/execution", self._dispatch_execution_receipt)
+        add("POST", "/api/dispatch/execute", self._execute_dispatch_command)
+        add("POST", "/api/dispatch/reconcile", self._reconcile_dispatch)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -261,3 +274,76 @@ class Api:
 
     def _probe_fault(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_fault_probe(rounds=_as_int(body, "rounds", 16))
+
+    def _register_dispatch_station(self, params: dict, body: dict) -> dict:
+        return self._platform.register_dispatch_station(
+            station_id=str(body.get("station_id", "")),
+            installed_kw=_as_float(body, "installed_kw", 0.0),
+            remaining_kw=_as_float(body, "remaining_kw", 0.0),
+            online=bool(body.get("online", True)),
+        )
+
+    def _dispatch_station_online(self, params: dict, body: dict) -> dict:
+        return self._platform.set_dispatch_station_online(str(body.get("station_id", "")), bool(body.get("online", True)))
+
+    def _dispatch_station_remaining(self, params: dict, body: dict) -> dict:
+        return self._platform.update_dispatch_station_remaining(
+            str(body.get("station_id", "")),
+            _as_float(body, "remaining_kw", 0.0),
+        )
+
+    def _dispatch_station_fail_delivery(self, params: dict, body: dict) -> dict:
+        return self._platform.fail_dispatch_deliveries(
+            str(body.get("station_id", "")),
+            _as_int(body, "count", 1),
+        )
+
+    def _submit_dispatch_target(self, params: dict, body: dict) -> dict:
+        station_ids = body.get("station_ids")
+        return self._platform.submit_dispatch_target(
+            order_id=str(body.get("order_id", "")),
+            target_kw=_as_float(body, "target_kw", 0.0),
+            method=str(body.get("method", "remaining")),
+            deadline_s=_as_float(body, "deadline_s", 120.0),
+            station_ids=list(station_ids) if station_ids is not None else None,
+        )
+
+    def _collect_dispatch(self, params: dict, body: dict) -> dict:
+        now = body.get("now")
+        return self._platform.collect_dispatch(now=None if now is None else float(now))
+
+    def _dispatch_order(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_order(str(params.get("order_id", "")))
+
+    def _dispatch_delivery_receipt(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_delivery_receipt(
+            order_id=str(body.get("order_id", "")),
+            station_id=str(body.get("station_id", "")),
+            command_no=_as_int(body, "command_no", 1),
+            delivered=bool(body.get("delivered", True)),
+        )
+
+    def _dispatch_execution_receipt(self, params: dict, body: dict) -> dict:
+        power = body.get("power_kw")
+        return self._platform.dispatch_execution_receipt(
+            order_id=str(body.get("order_id", "")),
+            station_id=str(body.get("station_id", "")),
+            command_no=_as_int(body, "command_no", 1),
+            status=str(body.get("status", "executed")),
+            power_kw=None if power is None else float(power),
+            reason=str(body.get("reason", "")),
+        )
+
+    def _execute_dispatch_command(self, params: dict, body: dict) -> dict:
+        command_no = body.get("command_no")
+        return self._platform.execute_dispatch_command(
+            str(body.get("order_id", "")),
+            str(body["station_id"]),
+            None if command_no is None else int(command_no),
+        )
+
+    def _reconcile_dispatch(self, params: dict, body: dict) -> dict:
+        return self._platform.reconcile_dispatch_order(
+            str(body.get("order_id", "")),
+            force=bool(body.get("force", False)),
+        )

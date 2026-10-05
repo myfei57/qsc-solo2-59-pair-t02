@@ -17,6 +17,7 @@ from .bms.bms import Bms
 from .clock import Clock, SystemClock
 from .config import StationConfig, config_to_mapping, default_config
 from .errors import StoreError
+from .dispatch.center import DispatchCenter
 from .eventbus import Event, EventBus
 from .fire.fire import FireLinkage
 from .grid.grid import GridTie
@@ -89,6 +90,8 @@ class Platform:
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=5.0)
         self.ids = IdFactory("op")
+        self.dispatch = DispatchCenter(self.clock, self._persist_dispatch)
+        self.dispatch.set_event_sink(self._publish_dispatch_event)
         self.mapping = RackMapping()
 
         self.racks: dict[str, Rack] = {}
@@ -130,6 +133,7 @@ class Platform:
             ("station", "soc", "state-of-charge"),
             ("station", "balance", "cell-balancer"),
             ("station", "quota", "quota-ledger"),
+            ("station", "dispatch", "peak-shaving-dispatch"),
             ("station", "audit", "run-audit"),
         ):
             self.namespaces.register(area, device, kind)
@@ -144,6 +148,9 @@ class Platform:
         if tail:
             self._last_audit_ts = AuditRecord.from_dict(tail[-1]).ts
         state = self.store.read("platform_state")
+        dispatch_state = self.store.read("dispatch_state")
+        if isinstance(dispatch_state, dict):
+            self.dispatch.restore(dispatch_state)
         if self.store.exists("platform_state") and isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
@@ -161,6 +168,16 @@ class Platform:
                 "station": self.station,
             },
         )
+
+    def _persist_dispatch(self) -> None:
+        """原子落盘调峰批次、站端幂等窗口和回执状态。"""
+
+        self.store.write("dispatch_state", self.dispatch.state())
+
+    def _publish_dispatch_event(self, action: str, payload: dict, severity: str) -> None:
+        """把调峰域动作接入统一事件总线与审计流水。"""
+
+        self.bus.publish(Event.of("dispatch", "dispatch", action, station=self.station, severity=severity, **payload))
 
     def _rack(self, rack_id: str | None) -> Rack:
         """按标识取簇，缺省取第一簇。"""
@@ -576,6 +593,7 @@ class Platform:
                 estimate = self.soc.value(now)
                 rack.set_soc(estimate.soc_pct)
             rolled = self.quota.roll(now)
+            dispatch = self.dispatch.collect_due(now)
             self.grid.monitor_frequency(50.0, now)
             self._persist()
             return {
@@ -584,6 +602,7 @@ class Platform:
                 "charge_limit_ratio": ratios,
                 "trips": trips,
                 "quota_rolled": rolled["rolled"],
+                "dispatch": dispatch,
                 "pcs_state": self.pcs.state_machine.state,
             }
 
@@ -748,6 +767,119 @@ class Platform:
 
         return config_to_mapping(self.config)
 
+    def dispatch_station_snapshot(self) -> dict:
+        """返回参与调峰联控的电站群画像。"""
+
+        return self.dispatch.station_snapshot()
+
+    def register_dispatch_station(
+        self,
+        station_id: str,
+        installed_kw: float,
+        remaining_kw: float,
+        online: bool = True,
+    ) -> dict:
+        """登记一个可接收调峰目标的站点。"""
+
+        with self._lock:
+            return self.dispatch.register_station(station_id, installed_kw, remaining_kw, online)
+
+    def set_dispatch_station_online(self, station_id: str, online: bool) -> dict:
+        """登记站点离线/恢复事件。"""
+
+        with self._lock:
+            return self.dispatch.set_station_online(station_id, online)
+
+    def update_dispatch_station_remaining(self, station_id: str, remaining_kw: float) -> dict:
+        """更新站点当下剩余响应能力。"""
+
+        with self._lock:
+            return self.dispatch.update_station_remaining(station_id, remaining_kw)
+
+    def fail_dispatch_deliveries(self, station_id: str, count: int = 1) -> dict:
+        """模拟在线站点连续若干次链路发送失败。"""
+
+        with self._lock:
+            return self.dispatch.fail_station_deliveries(station_id, count)
+
+    def submit_dispatch_target(
+        self,
+        order_id: str,
+        target_kw: float,
+        *,
+        method: str = "remaining",
+        deadline_s: float = 120.0,
+        station_ids: list[str] | None = None,
+    ) -> dict:
+        """接收调度目标，完成分解、首次下发和审计留痕。"""
+
+        with self._lock:
+            return self.dispatch.submit_target(
+                order_id,
+                target_kw,
+                method=method,
+                deadline_s=deadline_s,
+                station_ids=station_ids,
+            )
+
+    def collect_dispatch(self, now: float | None = None) -> dict:
+        """推进到期查询、自动补发、改派和到期对账。"""
+
+        with self._lock:
+            return self.dispatch.collect_due(now)
+
+    def dispatch_delivery_receipt(self, order_id: str, station_id: str, command_no: int, delivered: bool) -> dict:
+        """登记一条送达 ACK/NACK。"""
+
+        with self._lock:
+            return self.dispatch.mark_delivery_receipt(order_id, station_id, command_no, delivered)
+
+    def dispatch_execution_receipt(
+        self,
+        order_id: str,
+        station_id: str,
+        command_no: int,
+        status: str,
+        *,
+        power_kw: float | None = None,
+        reason: str = "",
+    ) -> dict:
+        """登记一条执行 ACK/NACK。"""
+
+        with self._lock:
+            return self.dispatch.mark_execution_receipt(
+                order_id,
+                station_id,
+                command_no,
+                status,
+                power_kw=power_kw,
+                reason=reason,
+            )
+
+    def execute_dispatch_command(self, order_id: str, station_id: str, command_no: int | None = None) -> dict:
+        """模拟站端执行已送达指令。"""
+
+        with self._lock:
+            return self.dispatch.execute_at_station(order_id, station_id, command_no)
+
+    def dispatch_order(self, order_id: str) -> dict:
+        """查询单条调峰批次。"""
+
+        with self._lock:
+            return self.dispatch.order(order_id)
+
+    def reconcile_dispatch_order(self, order_id: str, *, force: bool = False) -> dict:
+        """生成与调度端核对的关账结果。"""
+
+        with self._lock:
+            return self.dispatch.reconcile_order(order_id, force=force)
+
+    def dispatch_snapshot(self) -> dict:
+        """返回电站群、开放批次和对账状态快照。"""
+
+        with self._lock:
+            return self.dispatch.snapshot()
+
     def status(self) -> dict:
         """返回平台总状态。"""
 
@@ -767,6 +899,7 @@ class Platform:
             "grid": self.grid_snapshot(),
             "soc": self.soc_snapshot(),
             "balance": self.balance_snapshot(),
+            "dispatch": self.dispatch_snapshot(),
         }
 
     def snapshot(self) -> dict:
