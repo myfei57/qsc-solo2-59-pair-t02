@@ -39,6 +39,8 @@ from .store.jsonfile import JsonStore
 from .temp.temp import TempControl
 from .telemetry import TrendBuffer
 from .quota.quota import QuotaLedger
+from .dispatch.ledger import DispatchLedger
+from .dispatch.settings import STRATEGY_CAPABILITY, DispatchSettings
 
 DEFAULT_STATION = "station1"
 DEFAULT_RACK = "rk-01"
@@ -76,6 +78,7 @@ class Platform:
         clock: Clock | None = None,
         station: str = DEFAULT_STATION,
         rack_count: int = 2,
+        dispatch_settings: DispatchSettings | None = None,
     ) -> None:
         self.config = config or default_config()
         self.clock = clock or SystemClock()
@@ -85,6 +88,7 @@ class Platform:
         store = JsonStore(self.config.storage_root)
         self.store = store
         self.audit = AuditLog(self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512))
+        self.dispatch = DispatchLedger(self.clock, self.bus, store, dispatch_settings)
         self.namespaces = NamespaceRegistry(station)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=5.0)
@@ -692,6 +696,112 @@ class Platform:
 
         return self.namespaces.resolve(address)
 
+    # ----------------------------------------------------- 集群调峰调度
+
+    def dispatch_register(
+        self,
+        station_id: str,
+        name: str = "",
+        installed_kw: float = 1000.0,
+        headroom_kw: float | None = None,
+        auto_execute: bool = True,
+    ) -> dict:
+        """把一个成员站登记进调度站群。"""
+
+        with self._lock:
+            return self.dispatch.register_station(
+                station_id,
+                name or station_id,
+                float(installed_kw),
+                float(installed_kw if headroom_kw is None else headroom_kw),
+                auto_execute=auto_execute,
+            )
+
+    def dispatch_capability(self, station_id: str, capability_kw: float) -> dict:
+        """登记某站当下剩余响应能力上报。"""
+
+        with self._lock:
+            return self.dispatch.report_capability(station_id, float(capability_kw))
+
+    def dispatch_online(self, station_id: str) -> dict:
+        """站点链路恢复，触发断线续传（按命令号查对端事实）。"""
+
+        with self._lock:
+            return self.dispatch.station_online(station_id)
+
+    def dispatch_offline(self, station_id: str) -> dict:
+        """把站点置为离线（模拟断链或运维拉闸）。"""
+
+        with self._lock:
+            return self.dispatch.station_offline(station_id)
+
+    def dispatch_agent_fail(self, station_id: str, reason: str = "pcs_trip") -> dict:
+        """让某站下一条新指令执行被对端拒绝（复现"收到了没执行"）。"""
+
+        with self._lock:
+            self.dispatch.agent(station_id).fail_execute(reason)
+            return {"station_id": station_id, "fail_reason": reason}
+
+    def dispatch_target(
+        self,
+        dispatch_id: str,
+        target_kw: float,
+        strategy: str = STRATEGY_CAPABILITY,
+    ) -> dict:
+        """接收调度中心一条调峰目标：幂等去重 → 分解 → 首拍下发。"""
+
+        with self._lock:
+            return self.dispatch.receive(dispatch_id, float(target_kw), strategy)
+
+    def dispatch_ack(self, dispatch_id: str, station_id: str, ok: bool, reason: str | None = None) -> dict:
+        """回收某站接收回执。"""
+
+        with self._lock:
+            return self.dispatch.receive_ack(dispatch_id, station_id, ok, reason)
+
+    def dispatch_exec(
+        self,
+        dispatch_id: str,
+        station_id: str,
+        ok: bool,
+        actual_kw: float | None = None,
+        reason: str | None = None,
+    ) -> dict:
+        """回收某站执行回执。"""
+
+        with self._lock:
+            return self.dispatch.receive_exec(dispatch_id, station_id, ok, actual_kw, reason)
+
+    def dispatch_poll(self) -> dict:
+        """推进一个调度节拍：补发、超时判定、缺口改摊。"""
+
+        with self._lock:
+            return self.dispatch.poll()
+
+    def dispatch_settle(self, dispatch_id: str) -> dict:
+        """闭合一条调度指令并出账。"""
+
+        with self._lock:
+            return self.dispatch.settle(dispatch_id)
+
+    def dispatch_reconcile(self, dispatch_id: str, dispatcher: dict | None = None) -> dict:
+        """与调度端对一次账。"""
+
+        with self._lock:
+            return self.dispatch.reconcile(dispatch_id, dispatcher)
+
+    def dispatch_order(self, dispatch_id: str) -> dict:
+        with self._lock:
+            return self.dispatch.order(dispatch_id).as_dict()
+
+    def dispatch_orders(self) -> dict:
+        with self._lock:
+            return {"orders": self.dispatch.orders()}
+
+    def dispatch_fleet(self) -> dict:
+        with self._lock:
+            return self.dispatch.fleet_snapshot()
+
     def capacity(self) -> CapacityPlan:
         """返回站容量核算。"""
 
@@ -778,6 +888,8 @@ class Platform:
             "quota": self.quota_snapshot(),
             "audit": self.audit_snapshot(),
             "mapping": self.rack_mapping(),
+            "dispatch": self.dispatch_fleet(),
+            "dispatch_orders": self.dispatch_orders(),
             "config": config_to_mapping(self.config),
         }
 
@@ -787,6 +899,7 @@ def build_platform(
     clock: Clock | None = None,
     storage_root: str | None = None,
     rack_count: int = 2,
+    dispatch_settings: DispatchSettings | None = None,
 ) -> Platform:
     """按配置装配平台；``storage_root`` 可覆盖落盘目录。"""
 
@@ -805,4 +918,4 @@ def build_platform(
             balance=resolved.balance,
             quota=resolved.quota,
         )
-    return Platform(config=resolved, clock=clock, rack_count=rack_count)
+    return Platform(config=resolved, clock=clock, rack_count=rack_count, dispatch_settings=dispatch_settings)

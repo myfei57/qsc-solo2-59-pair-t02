@@ -100,6 +100,20 @@ class Api:
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/probe/pcs", self._probe_pcs)
         add("POST", "/api/probe/fault", self._probe_fault)
+        add("GET", "/api/dispatch/fleet", lambda params, body: self._platform.dispatch_fleet())
+        add("GET", "/api/dispatch/orders", lambda params, body: self._platform.dispatch_orders())
+        add("GET", "/api/dispatch/order/{dispatch_id}", self._dispatch_order)
+        add("POST", "/api/dispatch/stations", self._dispatch_register)
+        add("POST", "/api/dispatch/capability", self._dispatch_capability)
+        add("POST", "/api/dispatch/online", self._dispatch_online)
+        add("POST", "/api/dispatch/offline", self._dispatch_offline)
+        add("POST", "/api/dispatch/fail", self._dispatch_fail)
+        add("POST", "/api/dispatch/target", self._dispatch_target)
+        add("POST", "/api/dispatch/ack", self._dispatch_ack)
+        add("POST", "/api/dispatch/exec", self._dispatch_exec)
+        add("POST", "/api/dispatch/poll", lambda params, body: self._platform.dispatch_poll())
+        add("POST", "/api/dispatch/settle", self._dispatch_settle)
+        add("POST", "/api/dispatch/reconcile", self._dispatch_reconcile)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -261,3 +275,60 @@ class Api:
 
     def _probe_fault(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_fault_probe(rounds=_as_int(body, "rounds", 16))
+
+    def _dispatch_order(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_order(str(params.get("dispatch_id", "")))
+
+    def _dispatch_register(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_register(
+            station_id=str(body["station_id"]),
+            name=str(body.get("name", "")),
+            installed_kw=_as_float(body, "installed_kw", 1000.0),
+            headroom_kw=None if body.get("headroom_kw") is None else _as_float(body, "headroom_kw", 0.0),
+            auto_execute=bool(body.get("auto_execute", True)),
+        )
+
+    def _dispatch_capability(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_capability(
+            station_id=str(body["station_id"]),
+            capability_kw=_as_float(body, "capability_kw", 0.0),
+        )
+
+    def _dispatch_online(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_online(str(body["station_id"]))
+
+    def _dispatch_offline(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_offline(str(body["station_id"]))
+
+    def _dispatch_fail(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_agent_fail(str(body["station_id"]), str(body.get("reason", "pcs_trip")))
+
+    def _dispatch_target(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_target(
+            dispatch_id=str(body["dispatch_id"]),
+            target_kw=_as_float(body, "target_kw", 0.0),
+            strategy=str(body.get("strategy", "capability")),
+        )
+
+    def _dispatch_ack(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_ack(
+            dispatch_id=str(body["dispatch_id"]),
+            station_id=str(body["station_id"]),
+            ok=bool(body.get("ok", True)),
+            reason=body.get("reason"),
+        )
+
+    def _dispatch_exec(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_exec(
+            dispatch_id=str(body["dispatch_id"]),
+            station_id=str(body["station_id"]),
+            ok=bool(body.get("ok", True)),
+            actual_kw=None if body.get("actual_kw") is None else _as_float(body, "actual_kw", 0.0),
+            reason=body.get("reason"),
+        )
+
+    def _dispatch_settle(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_settle(str(body["dispatch_id"]))
+
+    def _dispatch_reconcile(self, params: dict, body: dict) -> dict:
+        return self._platform.dispatch_reconcile(str(body["dispatch_id"]), body.get("dispatcher"))

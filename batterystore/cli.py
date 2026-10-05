@@ -17,11 +17,13 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import replace
 
 from .app import Platform, build_platform
 from .clock import ManualClock, SystemClock
 from .config import config_to_mapping, default_config, load_config
 from .console.server import ConsoleServer, probe_endpoints
+from .dispatch.settings import DispatchSettings
 from .errors import StoreError
 
 DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/topology", "/api/audit", "/api/racks")
@@ -171,6 +173,125 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dispatch(args: argparse.Namespace) -> int:
+    """跑一遍集群调峰闭环：登记站群 → 上报能力 → 部分离线 → 两种分摊对比 →
+    超时补发／续传 → 缺口改摊 → 结算 → 与调度端对账。"""
+
+    clock = ManualClock()
+    config = load_config(args.config) if getattr(args, "config", None) else default_config()
+    settings = replace(
+        DispatchSettings.default(),
+        ack_timeout_s=float(args.ack_timeout_s),
+        execute_timeout_s=float(args.execute_timeout_s),
+        retry_backoff_s=float(args.retry_backoff_s),
+        reallocate_max=int(args.reallocate_rounds),
+    )
+    platform = build_platform(
+        config,
+        clock=clock,
+        storage_root=getattr(args, "storage_root", None),
+        rack_count=args.racks,
+        dispatch_settings=settings,
+    )
+    ledger = platform.dispatch
+
+    stations = [("st-a", 1000.0), ("st-b", 1000.0), ("st-c", 2000.0)]
+    for station_id, installed in stations:
+        platform.dispatch_register(station_id, station_id, installed_kw=installed, headroom_kw=installed)
+        platform.dispatch_capability(station_id, installed)
+
+    # 场景一：st-c（占一半装机）离线，对比两种策略的首轮分解差异。
+    platform.dispatch_offline("st-c")
+    capability_plan = platform.dispatch_target("PK-CAP-001", args.target_kw, strategy="capability")
+    # 同一分钟重发两次：只能返回原指令，不能第二次执行。
+    platform.dispatch_target("PK-CAP-001", args.target_kw, strategy="capability")
+    capability_dup = platform.dispatch_target("PK-CAP-001", args.target_kw, strategy="capability")
+    clock.advance(1)
+    platform.dispatch_poll()
+    capability_statement = platform.dispatch_settle("PK-CAP-001")
+
+    installed_plan = platform.dispatch_target("PK-INS-002", args.target_kw, strategy="installed")
+    clock.advance(1)
+    platform.dispatch_poll()  # 首轮节拍：离线站名义缺口触发改摊水瀑
+    installed_statement = platform.dispatch_settle("PK-INS-002")
+
+    # 场景二：st-a 收到了但执行失败（PCS 跳闸），缺口自动改摊给在线有余量的站。
+    platform.dispatch_online("st-c")
+    platform.dispatch_capability("st-a", 1000.0)
+    platform.dispatch_capability("st-b", 1000.0)
+    platform.dispatch_capability("st-c", 2000.0)
+    platform.dispatch_agent_fail("st-a", "pcs_trip")
+    nack_plan = platform.dispatch_target("PK-NACK-003", args.target_kw, strategy="capability")
+    clock.advance(1)
+    platform.dispatch_poll()
+    nack_statement = platform.dispatch_settle("PK-NACK-003")
+
+    # 用能力法结算的真实逐站值与调度端对账（总量与逐站一致）。
+    reconciliation = platform.dispatch_reconcile(
+        "PK-CAP-001",
+        {
+            "total_kw": capability_statement["executed_kw"],
+            "stations": {
+                station_id: value.get("actual_kw") or 0.0
+                for station_id, value in capability_statement["stations"].items()
+            },
+        },
+    )
+
+    report = {
+        "settings": {
+            "ack_timeout_s": settings.ack_timeout_s,
+            "execute_timeout_s": settings.execute_timeout_s,
+            "retry_backoff_s": settings.retry_backoff_s,
+            "reallocate_max": settings.reallocate_max,
+        },
+        "fleet": platform.dispatch_fleet(),
+        "capability": {
+            "initial_shares": capability_plan["plan"]["shares"],
+            "excluded": capability_plan["plan"]["excluded"],
+            "shortfall_kw": capability_plan["plan"]["shortfall_kw"],
+            "duplicate_hits": capability_dup["order"]["duplicate_hits"],
+            "statement": capability_statement,
+        },
+        "installed": {
+            "initial_shares": installed_plan["plan"]["shares"],
+            "nominal": installed_plan["plan"]["nominal"],
+            "gap_causes": installed_plan["plan"]["gap_causes"],
+            "shortfall_kw": installed_plan["plan"]["shortfall_kw"],
+            "reallocations": installed_statement["reallocations"],
+            "statement": {
+                key: installed_statement[key]
+                for key in ("executed_kw", "declared_shortfall_kw", "station_gaps_kw", "stations")
+            },
+        },
+        "nack_reallocate": {
+            "initial_shares": nack_plan["plan"]["shares"],
+            "statement": {
+                key: nack_statement[key]
+                for key in ("executed_kw", "declared_shortfall_kw", "station_gaps_kw", "stations", "reallocations")
+            },
+        },
+        "reconciliation": {
+            "matched": reconciliation["matched"],
+            "matched_total": reconciliation.get("matched_total"),
+            "variances": reconciliation["variances"],
+        },
+        "orders": platform.dispatch_orders(),
+    }
+    _dump(report)
+    failures = []
+    if capability_dup["order"]["duplicate_hits"] != 2:
+        failures.append("duplicate_dedup")
+    if not reconciliation["matched"]:
+        failures.append("reconcile_mismatch")
+    if nack_statement["declared_shortfall_kw"] != 0:
+        failures.append("nack_gap_not_reallocated")
+    if failures:
+        print(f"检查未通过: {failures}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -212,6 +333,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    dispatch = sub.add_parser("dispatch", help="跑一遍集群调峰闭环（分解/补发/改摊/对账）", parents=[common])
+    dispatch.add_argument("--target-kw", type=float, default=1000.0, help="调峰目标功率（kW）")
+    dispatch.add_argument("--ack-timeout-s", type=float, default=15.0, help="接收回执超时")
+    dispatch.add_argument("--execute-timeout-s", type=float, default=120.0, help="执行回执超时")
+    dispatch.add_argument("--retry-backoff-s", type=float, default=5.0, help="补发基础间隔（指数退避）")
+    dispatch.add_argument("--reallocate-rounds", type=int, default=2, help="缺口改摊最大轮数")
+    dispatch.set_defaults(func=_cmd_dispatch)
     return parser
 
 
